@@ -756,8 +756,16 @@ with gr.Blocks() as demo:
                 if (!editor) return;
                 const video = document.querySelector("#my-video1 video");
                 const image = editor.querySelector(".image-container img");
-                const sourceWidth = (video && video.videoWidth) || (image && image.naturalWidth) || 0;
-                const sourceHeight = (video && video.videoHeight) || (image && image.naturalHeight) || 0;
+                if (image && !image.dataset.maskEditorFitListener) {
+                    image.dataset.maskEditorFitListener = "true";
+                    image.addEventListener("load", () => {
+                        if (isOpen()) fitImage();
+                    });
+                }
+                // The editor image is the exact first frame being painted. The
+                // video element can retain stale metadata after replacing a file.
+                const sourceWidth = (image && image.naturalWidth) || (video && video.videoWidth) || 0;
+                const sourceHeight = (image && image.naturalHeight) || (video && video.videoHeight) || 0;
                 if (!sourceWidth || !sourceHeight) return;
                 const maxWidth = Math.max(1, window.innerWidth * 0.96 - 40);
                 const maxHeight = Math.max(1, Math.min(window.innerHeight - 170, window.innerHeight * 0.82));
