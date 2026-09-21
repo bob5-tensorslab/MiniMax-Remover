@@ -90,8 +90,8 @@ def read_uploaded_mask_video(mask_video_path, frame_count, source_fps, width, he
     ).astype(np.int64)
     if len(mask_indices) and mask_indices[-1] >= len(mask_reader):
         gr.Warning(
-            "The mask video is too short for the selected source-video duration. "
-            "Upload a longer mask video or reduce Tracking Frames N."
+            "掩码视频时长不足，无法覆盖当前源视频和选择的帧数。"
+            "请上传更长的掩码视频，或减少跟踪帧数 N。"
         )
         return None
 
@@ -111,9 +111,9 @@ def read_uploaded_mask_video(mask_video_path, frame_count, source_fps, width, he
 
 def build_fixed_mask_video(painted_data, video_path, n_frames, video_state):
     if not video_path:
-        return None, "Upload a source video first."
+        return None, "请先上传源视频。"
     if video_state.get("video_path") not in (None, video_path):
-        return None, "The source video is still refreshing. Wait, then try again."
+        return None, "源视频正在刷新，请稍后重试。"
     if not isinstance(painted_data, dict) or painted_data.get("mask") is None:
         return None, "Paint the target area on the first-frame editor first."
 
@@ -132,7 +132,7 @@ def build_fixed_mask_video(painted_data, video_path, n_frames, video_state):
     frame_count = min(len(source_reader), max(1, int(n_frames)))
     if frame_count < 1:
         del source_reader
-        return None, "The source video contains no frames."
+        return None, "源视频不包含可用帧。"
     source_fps = get_video_fps(source_reader)
     first_frame = source_reader[0].asnumpy()
     del source_reader
@@ -214,7 +214,7 @@ def handle_video_change(video_path, video_state):
 
 def segment_frame(evt: gr.SelectData, label, video_state):
     if video_state["origin_images"] is None:
-        gr.Warning("Please click \"Extract First Frame\" to extract the first frame first, then click the annotation")
+        gr.Warning("请先点击“提取首帧”，再在图像上点选目标。")
         return None
     x, y = evt.index
     new_point = [x, y]
@@ -307,7 +307,7 @@ def inference_and_return_video(
 
     source_video_path = video_path or video_state.get("video_path")
     if video_path and video_state.get("video_path") not in (None, video_path):
-        gr.Warning("The uploaded source video changed; wait for its first frame to refresh.")
+        gr.Warning("上传的源视频已变更，请等待首帧刷新完成。")
         return None
     if source_video_path and mask_video_path:
         source_reader = VideoReader(source_video_path, ctx=cpu(0))
@@ -316,7 +316,7 @@ def inference_and_return_video(
         images = [source_reader[i].asnumpy() for i in range(frame_count)]
         del source_reader
         if not images:
-            gr.Warning("The source video contains no frames")
+            gr.Warning("源视频不包含可用帧")
             return None
 
         height, width = images[0].shape[:2]
@@ -383,16 +383,16 @@ def inference_and_return_video(
 
 def track_video(n_frames, video_path, mask_video_path, video_state):
     if not video_path:
-        gr.Warning("Upload a source video before Tracking.")
+        gr.Warning("请先上传源视频，再执行跟踪。")
         return None, None
     if video_state.get("video_path") != video_path:
-        gr.Warning("The source video changed. Wait for its first frame to refresh, then run Tracking again.")
+        gr.Warning("源视频已变更，请等待首帧刷新完成后重新跟踪。")
         return None, None
     if video_state["origin_images"] is None:
-        gr.Warning("Upload a source video and click Extract First Frame first")
+        gr.Warning("请上传源视频并先点击“提取首帧”。")
         return None, None
     if not mask_video_path and video_state["masks"] is None:
-        gr.Warning("Please complete target segmentation on the first frame first, then click Tracking")
+        gr.Warning("请先在首帧完成目标分割，再点击“跟踪”。")
         return None, None
 
     obj_id = video_state["obj_id"]
