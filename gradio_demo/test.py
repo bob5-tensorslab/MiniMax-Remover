@@ -528,7 +528,7 @@ with gr.Blocks() as demo:
 
     with gr.Column():
         video_input = gr.Video(label="Upload Video", elem_id="my-video1")
-        get_info_btn = gr.Button("Extract First Frame", elem_id="my-btn")
+        get_info_btn = gr.Button("提取首帧", elem_id="my-btn")
 
         gr.Examples(
             examples=[
@@ -565,6 +565,23 @@ with gr.Blocks() as demo:
            height: 35% !important;
            margin: 0 auto;
         }
+        #my-mask-video {
+           width: 60% !important;
+           height: 35% !important;
+           margin: 0 auto;
+        }
+        #fixed-mask-editor {
+            width: 60% !important;
+            margin: 0 auto !important;
+        }
+        #fixed-mask-actions {
+            width: 60% !important;
+            margin: 0 auto !important;
+        }
+        #fixed-mask-status {
+            width: 60% !important;
+            margin: 0 auto !important;
+        }
         #my-md {
            margin: 0 auto;
         }
@@ -584,31 +601,215 @@ with gr.Blocks() as demo:
             overflow: hidden !important;
             white-space: normal !important;
         }
+        body.mask-editor-zoom-open {
+            overflow: hidden !important;
+        }
+        body.mask-editor-zoom-open::before {
+            display: none !important;
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            background: rgba(0, 0, 0, 0.68);
+        }
+        #fixed-mask-editor.mask-editor-expanded {
+            position: fixed !important;
+            inset: 2vh 2vw !important;
+            width: 96vw !important;
+            height: 96vh !important;
+            max-width: 96vw !important;
+            max-height: 96vh !important;
+            z-index: 10000 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            box-sizing: border-box !important;
+            min-height: 0 !important;
+            gap: 8px !important;
+            padding: 14px !important;
+            overflow: hidden !important;
+            background: var(--background-fill-primary, white) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.68) !important;
+        }
+        #fixed-mask-editor.mask-editor-expanded .image-container {
+            flex: 0 1 auto !important;
+            align-self: center !important;
+            width: var(--mask-editor-fit-width, 92vw) !important;
+            height: var(--mask-editor-fit-height, calc(96vh - 135px)) !important;
+            aspect-ratio: var(--mask-editor-aspect, auto) !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            max-width: none !important;
+            max-height: none !important;
+            margin: auto !important;
+        }
+        #fixed-mask-editor.mask-editor-expanded .image-container .wrap {
+            position: relative !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-height: 0 !important;
+        }
+        #fixed-mask-editor.mask-editor-expanded .image-container img {
+            width: 100% !important;
+            height: 100% !important;
+            max-width: none !important;
+            max-height: none !important;
+            object-fit: contain !important;
+        }
+        #fixed-mask-editor.mask-editor-expanded .image-container canvas {
+            width: 100% !important;
+            height: 100% !important;
+            max-width: none !important;
+            max-height: none !important;
+        }
         """
         with gr.Row(elem_id="my-btn"):
             point_prompt = gr.Radio(["正向点", "反向点"], label="点选类型", value="正向点")
             clear_btn = gr.Button("清空点选")
 
         with gr.Row(elem_id="my-btn"):
-            n_frames_slider = gr.Slider(minimum=1, maximum=201, value=81, step=1, label="Tracking Frames N")
-            track_btn = gr.Button("Tracking")
+            n_frames_slider = gr.Slider(minimum=1, maximum=361, value=81, step=1, label="Processing Frames N")
+            track_btn = gr.Button("跟踪并生成掩码")
+        fixed_mask_editor = gr.Image(
+            label="在首帧上涂抹固定掩码（白色区域将被移除）",
+            source="upload",
+            tool="sketch",
+            type="numpy",
+            brush_color="#ffffff",
+            brush_radius=20,
+            mask_opacity=0.65,
+            interactive=True,
+            elem_id="fixed-mask-editor",
+        )
+        with gr.Row(elem_id="fixed-mask-actions"):
+            fixed_mask_zoom_btn = gr.Button("放大涂抹区（按 Esc 返回）", elem_id="mask-editor-zoom-button", scale=1)
+            fixed_mask_btn = gr.Button("生成固定掩码视频（所选帧数）", scale=1)
+        fixed_mask_status = gr.Markdown(
+            "在首帧涂抹目标区域，生成固定掩码视频后，点击“移除目标”开始处理。",
+            elem_id="fixed-mask-status",
+        )
+        mask_video_input = gr.Video(
+            label="Mask Video (bright foreground on black background)",
+            elem_id="my-mask-video",
+        )
+        gr.Markdown(
+            "Direct removal: upload the source and mask videos, then click Remove; "
+            "Tracking is only needed to preview/propagate a point-selected mask."
+        )
         video_output = gr.Video(label="Tracking Result", elem_id="my-video")
 
         with gr.Column(elem_id="my-btn"):
             dilation_slider = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="Mask Dilation")
             inference_steps_slider = gr.Slider(minimum=1, maximum=100, value=6, step=1, label="Num Inference Steps")
 
-        remove_btn = gr.Button("Remove", elem_id="my-btn")
+        remove_btn = gr.Button("移除目标", elem_id="my-btn")
         remove_video = gr.Video(label="Remove Results", elem_id="my-video")
+        fixed_mask_btn.click(
+            build_fixed_mask_video,
+            inputs=[fixed_mask_editor, video_input, n_frames_slider, video_state],
+            outputs=[mask_video_input, fixed_mask_status],
+        )
         remove_btn.click(
             inference_and_return_video,
-            inputs=[dilation_slider, inference_steps_slider, video_state],
-            outputs=remove_video
+            inputs=[
+                dilation_slider,
+                inference_steps_slider,
+                video_input,
+                mask_video_input,
+                n_frames_slider,
+                video_state,
+            ],
+            outputs=remove_video,
         )
-        get_info_btn.click(get_video_info, inputs=[video_input, video_state], \
-                       outputs=image_output)
+        video_input.change(
+            fn=handle_video_change,
+            inputs=[video_input, video_state],
+            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video],
+        )
+        get_info_btn.click(
+            fn=handle_video_change,
+            inputs=[video_input, video_state],
+            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video],
+        )
         image_output.select(fn=segment_frame, inputs=[point_prompt, video_state], outputs=image_output)
         clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
-        track_btn.click(track_video, inputs=[n_frames_slider, video_state], outputs=video_output)
+        track_btn.click(
+            track_video,
+            inputs=[n_frames_slider, video_input, mask_video_input, video_state],
+            outputs=[video_output, mask_video_input],
+        )
 
+    demo.load(
+        fn=None,
+        inputs=[],
+        outputs=[],
+        _js="""() => {
+            const editorSelector = "#fixed-mask-editor";
+            const buttonSelector = "#mask-editor-zoom-button";
+            const getEditor = () => document.querySelector(editorSelector);
+            const isOpen = () => {
+                const editor = getEditor();
+                return !!editor && editor.classList.contains("mask-editor-expanded");
+            };
+            const fitImage = () => {
+                const editor = getEditor();
+                if (!editor) return;
+                const video = document.querySelector("#my-video1 video");
+                const image = editor.querySelector(".image-container img");
+                const sourceWidth = (video && video.videoWidth) || (image && image.naturalWidth) || 0;
+                const sourceHeight = (video && video.videoHeight) || (image && image.naturalHeight) || 0;
+                if (!sourceWidth || !sourceHeight) return;
+                const maxWidth = Math.max(1, window.innerWidth * 0.96 - 40);
+                const maxHeight = Math.max(1, Math.min(window.innerHeight - 170, window.innerHeight * 0.82));
+                const scale = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight);
+                const width = Math.floor(sourceWidth * scale);
+                const height = Math.floor(sourceHeight * scale);
+                editor.style.setProperty("--mask-editor-fit-width", `${width}px`);
+                editor.style.setProperty("--mask-editor-fit-height", `${height}px`);
+                editor.style.setProperty("--mask-editor-aspect", `${sourceWidth} / ${sourceHeight}`);
+            };
+            const setOpen = (open) => {
+                const editor = getEditor();
+                if (!editor) return;
+                if (open) fitImage();
+                editor.classList.toggle("mask-editor-expanded", open);
+                document.body.classList.toggle("mask-editor-zoom-open", open);
+                const zoomButton = document.querySelector(buttonSelector + " button");
+                if (zoomButton) {
+                    zoomButton.textContent = open ? "缩小并返回（Esc）" : "放大涂抹区（按 Esc 返回）";
+                }
+                if (open) {
+                    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+                } else {
+                    editor.style.removeProperty("--mask-editor-fit-width");
+                    editor.style.removeProperty("--mask-editor-fit-height");
+                    editor.style.removeProperty("--mask-editor-aspect");
+                    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+                }
+            };
+            window.addEventListener("resize", () => {
+                if (isOpen()) fitImage();
+            });
+            document.addEventListener("click", (event) => {
+                const target = event.target instanceof Element ? event.target : null;
+                if (!target) return;
+                const zoomButton = target.closest(buttonSelector);
+                if (zoomButton) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setOpen(!isOpen());
+                } else if (isOpen() && !getEditor().contains(target)) {
+                    setOpen(false);
+                }
+            }, true);
+            document.addEventListener("keydown", (event) => {
+                if (event.key === "Escape" && isOpen()) {
+                    setOpen(false);
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            }, true);
+            return [];
+        }""",
+    )
 demo.launch(server_name="0.0.0.0", server_port=8000)
