@@ -168,8 +168,8 @@ def build_fixed_mask_video(painted_data, video_path, n_frames, video_state):
         mask_clip.close()
 
     return mask_video_file, (
-        f"Fixed mask video created: {frame_count} frames at {source_fps:.3f} FPS. "
-        "Click Remove to process it."
+        f"已生成固定掩码视频：{frame_count} 帧，{source_fps:.3f} FPS。"
+        "点击“移除目标”开始处理。"
     )
 
 
@@ -510,21 +510,7 @@ text = """
 
 pipe, image_predictor, video_predictor = get_pipe_image_and_video_predictor()
 
-def toggle_fixed_mask_editor(zoomed):
-    expanded = not bool(zoomed)
-    return (
-        gr.Image.update(height=800 if expanded else None),
-        gr.Button.update(
-            value="\u7f29\u5c0f\u5e76\u8fd4\u56de\uff08Esc\uff09"
-            if expanded
-            else "\u653e\u5927\u6d82\u62b9\u533a\uff08\u6309 Esc \u8fd4\u56de\uff09"
-        ),
-        expanded,
-    )
-
-
 with gr.Blocks() as demo:
-    mask_editor_zoom_state = gr.State(False)
     video_state = gr.State({
         "origin_images": None,
         "inference_state": None,
@@ -541,7 +527,7 @@ with gr.Blocks() as demo:
     gr.Markdown(f"<div style='text-align:center;'>{text}</div>")
 
     with gr.Column():
-        video_input = gr.Video(label="Upload Video", elem_id="my-video1")
+        video_input = gr.Video(label="上传视频", elem_id="my-video1")
         get_info_btn = gr.Button("提取首帧", elem_id="my-btn")
 
         gr.Examples(
@@ -558,11 +544,11 @@ with gr.Blocks() as demo:
                 ["./normal_videos/5.mp4"],
             ],
             inputs=[video_input],
-            label="Choose a video to remove.",
+            label="选择要移除目标的视频。",
             elem_id="my-btn2"
         )
 
-        image_output = gr.Image(label="First Frame Segmentation", interactive=True, elem_id="my-video")#, height="35%", width="60%")
+        image_output = gr.Image(label="首帧目标分割", interactive=True, elem_id="my-video")#, height="35%", width="60%")
         demo.css = """
         #my-btn {
            width: 60% !important;
@@ -678,13 +664,22 @@ with gr.Blocks() as demo:
             margin: 0 !important;
             transform: translate(-50%, -50%) !important;
         }
+
+        #mask-video-help { width: 60% !important; box-sizing: border-box !important; margin: 0 auto !important; text-align: center !important; overflow-wrap: anywhere !important; }
+        .mask-editor-close { display: none !important; }
+        #fixed-mask-editor.mask-editor-expanded .mask-editor-close.mask-editor-close-visible {
+            position: absolute !important; top: 12px !important; right: 12px !important; z-index: 10020 !important;
+            display: flex !important; align-items: center !important; justify-content: center !important; width: 38px !important; height: 38px !important;
+            min-width: 38px !important; padding: 0 !important; border: 0 !important; border-radius: 50% !important;
+            background: rgba(30, 30, 30, .78) !important; color: white !important; font-size: 30px !important; line-height: 1 !important; cursor: pointer !important;
+        }
         """
         with gr.Row(elem_id="my-btn"):
             point_prompt = gr.Radio(["正向点", "反向点"], label="点选类型", value="正向点")
             clear_btn = gr.Button("清空点选")
 
         with gr.Row(elem_id="my-btn"):
-            n_frames_slider = gr.Slider(minimum=1, maximum=361, value=81, step=1, label="Processing Frames N")
+            n_frames_slider = gr.Slider(minimum=1, maximum=361, value=81, step=1, label="处理帧数 N")
             track_btn = gr.Button("跟踪并生成掩码")
         fixed_mask_editor = gr.Image(
             label="在首帧上涂抹固定掩码（白色区域将被移除）",
@@ -705,26 +700,22 @@ with gr.Blocks() as demo:
             elem_id="fixed-mask-status",
         )
         mask_video_input = gr.Video(
-            label="Mask Video (bright foreground on black background)",
+            label="掩码视频（黑底、亮色前景）",
             elem_id="my-mask-video",
         )
         gr.Markdown(
-            "Direct removal: upload the source and mask videos, then click Remove; "
-            "Tracking is only needed to preview/propagate a point-selected mask."
+            "直接移除：上传源视频与掩码视频后，点击“移除目标”即可处理；"
+            "点选掩码仅在需要预览或传播跟踪时使用。",
+            elem_id="mask-video-help",
         )
-        video_output = gr.Video(label="Tracking Result", elem_id="my-video")
+        video_output = gr.Video(label="跟踪结果", elem_id="my-video")
 
         with gr.Column(elem_id="my-btn"):
-            dilation_slider = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="Mask Dilation")
-            inference_steps_slider = gr.Slider(minimum=1, maximum=100, value=6, step=1, label="Num Inference Steps")
+            dilation_slider = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="掩码膨胀")
+            inference_steps_slider = gr.Slider(minimum=1, maximum=100, value=6, step=1, label="推理步数")
 
         remove_btn = gr.Button("移除目标", elem_id="my-btn")
-        remove_video = gr.Video(label="Remove Results", elem_id="my-video")
-        fixed_mask_zoom_btn.click(
-            toggle_fixed_mask_editor,
-            inputs=[mask_editor_zoom_state],
-            outputs=[fixed_mask_editor, fixed_mask_zoom_btn, mask_editor_zoom_state],
-        )
+        remove_video = gr.Video(label="移除结果", elem_id="my-video")
         fixed_mask_btn.click(
             build_fixed_mask_video,
             inputs=[fixed_mask_editor, video_input, n_frames_slider, video_state],
@@ -761,48 +752,35 @@ with gr.Blocks() as demo:
         )
 
     demo.load(
-        fn=None,
-        inputs=[],
-        outputs=[],
+        fn=None, inputs=[], outputs=[],
         _js="""() => {
-            const editorSelector = "#fixed-mask-editor";
-            const buttonSelector = "#mask-editor-zoom-button";
-            let syncingClose = false;
+            const editorSelector = "#fixed-mask-editor", buttonSelector = "#mask-editor-zoom-button";
+            const openLabel = "\u7f29\u5c0f\u5e76\u8fd4\u56de\uff08Esc\uff09", closedLabel = "\u653e\u5927\u6d82\u62b9\u533a\uff08\u6309 Esc \u8fd4\u56de\uff09";
             const getEditor = () => document.querySelector(editorSelector);
-            const isOpen = () => {
-                const editor = getEditor();
-                return !!editor && editor.classList.contains("mask-editor-expanded");
-            };
-            const updateClass = (open) => {
-                const editor = getEditor();
-                if (!editor) return;
+            const getButton = () => document.querySelector(buttonSelector + " button") || document.querySelector(buttonSelector);
+            const isOpen = () => { const e = getEditor(); return !!e && e.classList.contains("mask-editor-expanded"); };
+            const setOpen = (open) => {
+                const editor = getEditor(); if (!editor) return;
                 editor.classList.toggle("mask-editor-expanded", open);
                 document.body.classList.toggle("mask-editor-zoom-open", open);
+                const button = getButton(); if (button) button.textContent = open ? openLabel : closedLabel;
+                let close = editor.querySelector(".mask-editor-close");
+                if (!close) {
+                    close = document.createElement("button"); close.type = "button"; close.className = "mask-editor-close";
+                    close.title = "\u9000\u51fa\u653e\u5927\u6a21\u5f0f"; close.setAttribute("aria-label", "\u9000\u51fa\u653e\u5927\u6a21\u5f0f"); close.textContent = "\u00d7";
+                    close.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); setOpen(false); });
+                    editor.appendChild(close);
+                }
+                close.classList.toggle("mask-editor-close-visible", open);
                 if (open) editor.scrollIntoView({block: "center"});
             };
             document.addEventListener("click", (event) => {
                 const target = event.target instanceof Element ? event.target : null;
-                if (!target) return;
-                if (target.closest(buttonSelector)) {
-                    if (syncingClose) {
-                        syncingClose = false;
-                        return;
-                    }
-                    // Leave the event intact so Gradio can update the canvas height.
-                    updateClass(!isOpen());
-                }
+                if (!target || !target.closest(buttonSelector)) return;
+                event.preventDefault(); event.stopImmediatePropagation(); setOpen(!isOpen());
             }, true);
             document.addEventListener("keydown", (event) => {
-                if (event.key === "Escape" && isOpen()) {
-                    const button = document.querySelector(buttonSelector + " button");
-                    updateClass(false);
-                    if (button) {
-                        syncingClose = true;
-                        button.click();
-                    }
-                    event.preventDefault();
-                    event.stopPropagation();
-                }
+                if (event.key === "Escape" && isOpen()) { setOpen(false); event.preventDefault(); event.stopImmediatePropagation(); }
             }, true);
             return [];
         }""",
