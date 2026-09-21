@@ -74,12 +74,120 @@ def get_pipe_image_and_video_predictor():
 
     return pipe, image_predictor, video_predictor
 
+def get_video_fps(video_reader):
+    try:
+        fps = float(video_reader.get_avg_fps())
+    except (AttributeError, TypeError, ValueError):
+        fps = 15.0
+    return fps if np.isfinite(fps) and fps > 0 else 15.0
+
+
+def read_uploaded_mask_video(mask_video_path, frame_count, source_fps, width, height):
+    mask_reader = VideoReader(mask_video_path, ctx=cpu(0))
+    mask_fps = get_video_fps(mask_reader)
+    mask_indices = np.rint(
+        np.arange(frame_count, dtype=np.float64) * mask_fps / source_fps
+    ).astype(np.int64)
+    if len(mask_indices) and mask_indices[-1] >= len(mask_reader):
+        gr.Warning(
+            "The mask video is too short for the selected source-video duration. "
+            "Upload a longer mask video or reduce Tracking Frames N."
+        )
+        return None
+
+    masks = []
+    for mask_idx in mask_indices:
+        mask_frame = mask_reader[int(mask_idx)].asnumpy()
+        # Treat bright pixels in any channel as foreground so both white masks
+        # and colored annotation masks can be used.
+        binary_mask = np.any(mask_frame > 127, axis=2).astype(np.uint8)
+        binary_mask = cv2.resize(
+            binary_mask, (width, height), interpolation=cv2.INTER_NEAREST
+        )
+        masks.append(np.repeat(binary_mask[:, :, None], 3, axis=2).astype(np.float32))
+    del mask_reader
+    return masks
+
+
+def build_fixed_mask_video(painted_data, video_path, n_frames, video_state):
+    if not video_path:
+        return None, "Upload a source video first."
+    if video_state.get("video_path") not in (None, video_path):
+        return None, "The source video is still refreshing. Wait, then try again."
+    if not isinstance(painted_data, dict) or painted_data.get("mask") is None:
+        return None, "Paint the target area on the first-frame editor first."
+
+    painted_mask = np.asarray(painted_data["mask"])
+    if painted_mask.ndim == 3:
+        painted_mask = np.max(painted_mask[..., :3], axis=2)
+    elif painted_mask.ndim != 2:
+        return None, "Could not read the painted mask."
+    mask_max = float(np.max(painted_mask))
+    threshold = 0.5 if np.issubdtype(painted_mask.dtype, np.floating) and mask_max <= 1 else 127
+    foreground = painted_mask > threshold
+    if not np.any(foreground):
+        return None, "The mask is empty. Paint the object to remove."
+
+    source_reader = VideoReader(video_path, ctx=cpu(0))
+    frame_count = min(len(source_reader), max(1, int(n_frames)))
+    if frame_count < 1:
+        del source_reader
+        return None, "The source video contains no frames."
+    source_fps = get_video_fps(source_reader)
+    first_frame = source_reader[0].asnumpy()
+    del source_reader
+    height, width = first_frame.shape[:2]
+
+    if foreground.shape != (height, width):
+        foreground = cv2.resize(
+            foreground.astype(np.uint8),
+            (width, height),
+            interpolation=cv2.INTER_NEAREST,
+        ) > 0
+
+    mask_frame = foreground.astype(np.uint8) * 255
+    # libx264 requires even dimensions; the reader resizes back to source size.
+    mask_frame = np.pad(
+        mask_frame,
+        ((0, mask_frame.shape[0] % 2), (0, mask_frame.shape[1] % 2)),
+        mode="constant",
+    )
+    mask_rgb = np.repeat(mask_frame[:, :, None], 3, axis=2)
+    mask_video_file = f"/tmp/{time.time()}-{random.random()}-fixed_mask.mp4"
+    mask_clip = ImageSequenceClip([mask_rgb] * frame_count, fps=source_fps)
+    try:
+        mask_clip.write_videofile(
+            mask_video_file,
+            codec="libx264",
+            audio=False,
+            verbose=False,
+            logger=None,
+            ffmpeg_params=["-frames:v", str(frame_count)],
+        )
+    finally:
+        mask_clip.close()
+
+    return mask_video_file, (
+        f"Fixed mask video created: {frame_count} frames at {source_fps:.3f} FPS. "
+        "Click Remove to process it."
+    )
+
+
 def get_video_info(video_path, video_state):
     video_state["input_points"] = []
     video_state["scaled_points"] = []
     video_state["input_labels"] = []
     video_state["frame_idx"] = 0
+    video_state["origin_images"] = None
+    video_state["inference_state"] = None
+    video_state["video_path"] = None
+    video_state["video_fps"] = 15.0
+    video_state["masks"] = None
+    video_state["painted_images"] = None
+    if not video_path:
+        return None
     vr = VideoReader(video_path, ctx=cpu(0))
+    video_state["video_fps"] = get_video_fps(vr)
     first_frame = vr[0].asnumpy()
     del vr
 
@@ -99,13 +207,18 @@ def get_video_info(video_path, video_state):
     image = Image.fromarray(first_frame)
     return image
 
+
+def handle_video_change(video_path, video_state):
+    image = get_video_info(video_path, video_state)
+    return image, image, video_state, None, None, None
+
 def segment_frame(evt: gr.SelectData, label, video_state):
     if video_state["origin_images"] is None:
         gr.Warning("Please click \"Extract First Frame\" to extract the first frame first, then click the annotation")
         return None
     x, y = evt.index
     new_point = [x, y]
-    label_value = 1 if label == "Positive" else 0
+    label_value = 1 if label == "正向点" else 0
 
     video_state["input_points"].append(new_point)
     video_state["input_labels"].append(label_value)
@@ -176,12 +289,55 @@ def preprocess_for_removal(images, masks):
         out_masks.append(msk_resized)
     arr_images = np.stack(out_images)
     arr_masks = np.stack(out_masks)
+    if arr_masks.ndim == 3:
+        arr_masks = arr_masks[:, :, :, None]
     return torch.from_numpy(arr_images).half().to(device), torch.from_numpy(arr_masks).half().to(device)
 
 
-def inference_and_return_video(dilation_iterations, num_inference_steps, video_state=None):
-    if video_state["origin_images"] is None or video_state["masks"] is None:
+def inference_and_return_video(
+    dilation_iterations,
+    num_inference_steps,
+    video_path,
+    mask_video_path,
+    n_frames,
+    video_state=None,
+):
+    if video_state is None:
+        video_state = {}
+
+    source_video_path = video_path or video_state.get("video_path")
+    if video_path and video_state.get("video_path") not in (None, video_path):
+        gr.Warning("The uploaded source video changed; wait for its first frame to refresh.")
         return None
+    if source_video_path and mask_video_path:
+        source_reader = VideoReader(source_video_path, ctx=cpu(0))
+        source_fps = get_video_fps(source_reader)
+        frame_count = min(len(source_reader), int(n_frames))
+        images = [source_reader[i].asnumpy() for i in range(frame_count)]
+        del source_reader
+        if not images:
+            gr.Warning("The source video contains no frames")
+            return None
+
+        height, width = images[0].shape[:2]
+        masks = read_uploaded_mask_video(
+            mask_video_path, frame_count, source_fps, width, height
+        )
+        if masks is None:
+            return None
+        video_state["origin_images"] = images
+        video_state["masks"] = masks
+        video_state["video_path"] = source_video_path
+        video_state["video_fps"] = source_fps
+    elif video_state.get("origin_images") is None or video_state.get("masks") is None:
+        gr.Warning(
+            "Upload both the source and mask videos for direct removal, or run Tracking first."
+        )
+        return None
+    elif video_path and video_state.get("video_path") != video_path:
+        gr.Warning("The uploaded source video changed; upload its mask video or run Tracking again.")
+        return None
+
     images = video_state["origin_images"]
     masks = video_state["masks"]
 
@@ -213,26 +369,40 @@ def inference_and_return_video(dilation_iterations, num_inference_steps, video_s
         output_frames = [img for img in out]
 
     video_file = f"/tmp/{time.time()}-{random.random()}-removed_output.mp4"
-    clip = ImageSequenceClip(output_frames, fps=15)
-    clip.write_videofile(video_file, codec='libx264', audio=False, verbose=False, logger=None)
+    clip = ImageSequenceClip(output_frames, fps=video_state.get("video_fps", 15.0))
+    clip.write_videofile(
+        video_file,
+        codec='libx264',
+        audio=False,
+        verbose=False,
+        logger=None,
+        ffmpeg_params=["-frames:v", str(len(output_frames))],
+    )
     return video_file
 
 
-def track_video(n_frames, video_state):
-    if video_state["origin_images"] is None or video_state["masks"] is None:
+def track_video(n_frames, video_path, mask_video_path, video_state):
+    if not video_path:
+        gr.Warning("Upload a source video before Tracking.")
+        return None, None
+    if video_state.get("video_path") != video_path:
+        gr.Warning("The source video changed. Wait for its first frame to refresh, then run Tracking again.")
+        return None, None
+    if video_state["origin_images"] is None:
+        gr.Warning("Upload a source video and click Extract First Frame first")
+        return None, None
+    if not mask_video_path and video_state["masks"] is None:
         gr.Warning("Please complete target segmentation on the first frame first, then click Tracking")
-        return None
+        return None, None
 
-    input_points = video_state["input_points"]
-    input_labels = video_state["input_labels"]
-    frame_idx = video_state["frame_idx"]
     obj_id = video_state["obj_id"]
-    scaled_points = video_state["scaled_points"]
 
-    vr = VideoReader(video_state["video_path"], ctx=cpu(0))
-    height, width = vr[0].shape[0:2]
-    images = [vr[i].asnumpy() for i in range(min(len(vr), n_frames))]
+    vr = VideoReader(video_path, ctx=cpu(0))
+    source_fps = get_video_fps(vr)
+    frame_count = min(len(vr), int(n_frames))
+    images = [vr[i].asnumpy() for i in range(frame_count)]
     del vr
+    video_state["video_fps"] = source_fps
 
     if images[0].shape[0] > images[0].shape[1]:
         W_ = W
@@ -244,43 +414,79 @@ def track_video(n_frames, video_state):
     images = [cv2.resize(img, (W_, H_)) for img in images]
     video_state["origin_images"] = images
     images = np.array(images)
-    inference_state = video_predictor.init_state(images=images/255, device=device)
-    video_state["inference_state"] = inference_state
-
-    if len(torch.from_numpy(video_state["masks"][0]).shape) == 3:
-        mask = torch.from_numpy(video_state["masks"][0])[:,:,0]
+    if mask_video_path:
+        mask_frames = read_uploaded_mask_video(
+            mask_video_path, frame_count, source_fps, W_, H_
+        )
+        if mask_frames is None:
+            return None, None
     else:
-        mask = torch.from_numpy(video_state["masks"][0])
+        inference_state = video_predictor.init_state(images=images/255, device=device)
+        video_state["inference_state"] = inference_state
 
-    video_predictor.add_new_mask(
-        inference_state=inference_state,
-        frame_idx=0,
-        obj_id=obj_id,
-        mask=mask
-    )
+        if len(torch.from_numpy(video_state["masks"][0]).shape) == 3:
+            mask = torch.from_numpy(video_state["masks"][0])[:,:,0]
+        else:
+            mask = torch.from_numpy(video_state["masks"][0])
+
+        video_predictor.add_new_mask(
+            inference_state=inference_state,
+            frame_idx=0,
+            obj_id=obj_id,
+            mask=mask
+        )
 
     output_frames = []
-    mask_frames = []
     color = np.array(COLOR_PALETTE[int(time.time()) % len(COLOR_PALETTE)], dtype=np.float32) / 255.0
     color = color[None, None, :]
-    for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
-        frame = images[out_frame_idx].astype(np.float32) / 255.0
-        mask = np.zeros((H, W, 3), dtype=np.float32)
-        for i, logit in enumerate(out_mask_logits):
-            out_mask = logit.cpu().squeeze().detach().numpy()
-            out_mask = (out_mask[:,:,None] > 0).astype(np.float32)
-            mask += out_mask
-        mask = np.clip(mask, 0, 1)
-        mask = cv2.resize(mask, (W_, H_))
-        mask_frames.append(mask)
-        painted = (1 - mask * 0.5) * frame + mask * 0.5 * color
-        painted = np.uint8(np.clip(painted * 255, 0, 255))
-        output_frames.append(painted)
+    if mask_video_path:
+        for frame, mask in zip(images, mask_frames):
+            frame = frame.astype(np.float32) / 255.0
+            painted = (1 - mask * 0.5) * frame + mask * 0.5 * color
+            output_frames.append(np.uint8(np.clip(painted * 255, 0, 255)))
+    else:
+        tracked_masks = []
+        for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state):
+            frame = images[out_frame_idx].astype(np.float32) / 255.0
+            mask = np.zeros((H, W, 3), dtype=np.float32)
+            for i, logit in enumerate(out_mask_logits):
+                out_mask = logit.cpu().squeeze().detach().numpy()
+                out_mask = (out_mask[:,:,None] > 0).astype(np.float32)
+                mask += out_mask
+            mask = np.clip(mask, 0, 1)
+            mask = cv2.resize(mask, (W_, H_))
+            tracked_masks.append(mask)
+            painted = (1 - mask * 0.5) * frame + mask * 0.5 * color
+            output_frames.append(np.uint8(np.clip(painted * 255, 0, 255)))
+        mask_frames = tracked_masks
+
     video_state["masks"] = mask_frames
+    mask_output_frames = [
+        np.uint8((np.asarray(mask) > 0.5).astype(np.uint8) * 255)
+        for mask in mask_frames
+    ]
+    mask_video_file = f"/tmp/{time.time()}-{random.random()}-tracked_mask.mp4"
+    mask_clip = ImageSequenceClip(mask_output_frames, fps=source_fps)
+    mask_clip.write_videofile(
+        mask_video_file,
+        codec='libx264',
+        audio=False,
+        verbose=False,
+        logger=None,
+        ffmpeg_params=["-frames:v", str(len(mask_output_frames))],
+    )
+
     video_file = f"/tmp/{time.time()}-{random.random()}-tracked_output.mp4"
-    clip = ImageSequenceClip(output_frames, fps=15)
-    clip.write_videofile(video_file, codec='libx264', audio=False, verbose=False, logger=None)
-    return video_file
+    clip = ImageSequenceClip(output_frames, fps=source_fps)
+    clip.write_videofile(
+        video_file,
+        codec='libx264',
+        audio=False,
+        verbose=False,
+        logger=None,
+        ffmpeg_params=["-frames:v", str(len(output_frames))],
+    )
+    return video_file, mask_video_file
 
 text = """
 <div style='text-align:center; font-size:32px; font-family: Arial, Helvetica, sans-serif;'>
@@ -311,6 +517,7 @@ with gr.Blocks() as demo:
         "masks": None,  # Store user-generated masks
         "painted_images": None,
         "video_path": None,
+        "video_fps": 15.0,
         "input_points": [],
         "scaled_points": [],
         "input_labels": [],
@@ -379,8 +586,8 @@ with gr.Blocks() as demo:
         }
         """
         with gr.Row(elem_id="my-btn"):
-            point_prompt = gr.Radio(["Positive", "Negative"], label="Click Type", value="Positive")
-            clear_btn = gr.Button("Clear All Clicks")
+            point_prompt = gr.Radio(["正向点", "反向点"], label="点选类型", value="正向点")
+            clear_btn = gr.Button("清空点选")
 
         with gr.Row(elem_id="my-btn"):
             n_frames_slider = gr.Slider(minimum=1, maximum=201, value=81, step=1, label="Tracking Frames N")
