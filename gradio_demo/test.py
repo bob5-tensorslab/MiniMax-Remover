@@ -510,7 +510,21 @@ text = """
 
 pipe, image_predictor, video_predictor = get_pipe_image_and_video_predictor()
 
+def toggle_fixed_mask_editor(zoomed):
+    expanded = not bool(zoomed)
+    return (
+        gr.Image.update(height=800 if expanded else None),
+        gr.Button.update(
+            value="\u7f29\u5c0f\u5e76\u8fd4\u56de\uff08Esc\uff09"
+            if expanded
+            else "\u653e\u5927\u6d82\u62b9\u533a\uff08\u6309 Esc \u8fd4\u56de\uff09"
+        ),
+        expanded,
+    )
+
+
 with gr.Blocks() as demo:
+    mask_editor_zoom_state = gr.State(False)
     video_state = gr.State({
         "origin_images": None,
         "inference_state": None,
@@ -623,8 +637,7 @@ with gr.Blocks() as demo:
             display: flex !important;
             flex-direction: column !important;
             box-sizing: border-box !important;
-            min-height: 0 !important;
-            gap: 8px !important;
+            margin: 0 !important;
             padding: 14px !important;
             overflow: hidden !important;
             background: var(--background-fill-primary, white) !important;
@@ -632,35 +645,38 @@ with gr.Blocks() as demo:
             box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.68) !important;
         }
         #fixed-mask-editor.mask-editor-expanded .image-container {
-            flex: 0 1 auto !important;
-            align-self: center !important;
-            width: var(--mask-editor-fit-width, 92vw) !important;
-            height: var(--mask-editor-fit-height, calc(96vh - 135px)) !important;
-            aspect-ratio: var(--mask-editor-aspect, auto) !important;
-            min-width: 0 !important;
+            position: relative !important;
+            flex: 1 1 auto !important;
+            width: 100% !important;
+            height: auto !important;
             min-height: 0 !important;
-            max-width: none !important;
-            max-height: none !important;
-            margin: auto !important;
+            overflow: hidden !important;
         }
-        #fixed-mask-editor.mask-editor-expanded .image-container .wrap {
+        /*
+         * The canvas wrapper is the direct child. Do not target every .wrap:
+         * Gradio also uses that class for the brush controls.
+         */
+        #fixed-mask-editor.mask-editor-expanded .image-container > .wrap {
             position: relative !important;
             width: 100% !important;
             height: 100% !important;
             min-height: 0 !important;
         }
-        #fixed-mask-editor.mask-editor-expanded .image-container img {
-            width: 100% !important;
-            height: 100% !important;
-            max-width: none !important;
-            max-height: none !important;
-            object-fit: contain !important;
-        }
+        /*
+         * Set one dimension only. CSS derives the other from the canvas buffer,
+         * so wide and tall frames both retain their exact source aspect ratio.
+         */
         #fixed-mask-editor.mask-editor-expanded .image-container canvas {
-            width: 100% !important;
+            position: absolute !important;
+            inset: auto !important;
+            top: 50% !important;
+            left: 50% !important;
+            width: auto !important;
             height: 100% !important;
-            max-width: none !important;
-            max-height: none !important;
+            max-width: 100% !important;
+            max-height: 100% !important;
+            margin: 0 !important;
+            transform: translate(-50%, -50%) !important;
         }
         """
         with gr.Row(elem_id="my-btn"):
@@ -704,6 +720,11 @@ with gr.Blocks() as demo:
 
         remove_btn = gr.Button("移除目标", elem_id="my-btn")
         remove_video = gr.Video(label="Remove Results", elem_id="my-video")
+        fixed_mask_zoom_btn.click(
+            toggle_fixed_mask_editor,
+            inputs=[mask_editor_zoom_state],
+            outputs=[fixed_mask_editor, fixed_mask_zoom_btn, mask_editor_zoom_state],
+        )
         fixed_mask_btn.click(
             build_fixed_mask_video,
             inputs=[fixed_mask_editor, video_input, n_frames_slider, video_state],
@@ -746,73 +767,39 @@ with gr.Blocks() as demo:
         _js="""() => {
             const editorSelector = "#fixed-mask-editor";
             const buttonSelector = "#mask-editor-zoom-button";
+            let syncingClose = false;
             const getEditor = () => document.querySelector(editorSelector);
             const isOpen = () => {
                 const editor = getEditor();
                 return !!editor && editor.classList.contains("mask-editor-expanded");
             };
-            const fitImage = () => {
+            const updateClass = (open) => {
                 const editor = getEditor();
                 if (!editor) return;
-                const video = document.querySelector("#my-video1 video");
-                const image = editor.querySelector(".image-container img");
-                if (image && !image.dataset.maskEditorFitListener) {
-                    image.dataset.maskEditorFitListener = "true";
-                    image.addEventListener("load", () => {
-                        if (isOpen()) fitImage();
-                    });
-                }
-                // The editor image is the exact first frame being painted. The
-                // video element can retain stale metadata after replacing a file.
-                const sourceWidth = (image && image.naturalWidth) || (video && video.videoWidth) || 0;
-                const sourceHeight = (image && image.naturalHeight) || (video && video.videoHeight) || 0;
-                if (!sourceWidth || !sourceHeight) return;
-                const maxWidth = Math.max(1, window.innerWidth * 0.96 - 40);
-                const maxHeight = Math.max(1, Math.min(window.innerHeight - 170, window.innerHeight * 0.82));
-                const scale = Math.min(maxWidth / sourceWidth, maxHeight / sourceHeight);
-                const width = Math.floor(sourceWidth * scale);
-                const height = Math.floor(sourceHeight * scale);
-                editor.style.setProperty("--mask-editor-fit-width", `${width}px`);
-                editor.style.setProperty("--mask-editor-fit-height", `${height}px`);
-                editor.style.setProperty("--mask-editor-aspect", `${sourceWidth} / ${sourceHeight}`);
-            };
-            const setOpen = (open) => {
-                const editor = getEditor();
-                if (!editor) return;
-                if (open) fitImage();
                 editor.classList.toggle("mask-editor-expanded", open);
                 document.body.classList.toggle("mask-editor-zoom-open", open);
-                const zoomButton = document.querySelector(buttonSelector + " button");
-                if (zoomButton) {
-                    zoomButton.textContent = open ? "缩小并返回（Esc）" : "放大涂抹区（按 Esc 返回）";
-                }
-                if (open) {
-                    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
-                } else {
-                    editor.style.removeProperty("--mask-editor-fit-width");
-                    editor.style.removeProperty("--mask-editor-fit-height");
-                    editor.style.removeProperty("--mask-editor-aspect");
-                    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
-                }
+                if (open) editor.scrollIntoView({block: "center"});
             };
-            window.addEventListener("resize", () => {
-                if (isOpen()) fitImage();
-            });
             document.addEventListener("click", (event) => {
                 const target = event.target instanceof Element ? event.target : null;
                 if (!target) return;
-                const zoomButton = target.closest(buttonSelector);
-                if (zoomButton) {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    setOpen(!isOpen());
-                } else if (isOpen() && !getEditor().contains(target)) {
-                    setOpen(false);
+                if (target.closest(buttonSelector)) {
+                    if (syncingClose) {
+                        syncingClose = false;
+                        return;
+                    }
+                    // Leave the event intact so Gradio can update the canvas height.
+                    updateClass(!isOpen());
                 }
             }, true);
             document.addEventListener("keydown", (event) => {
                 if (event.key === "Escape" && isOpen()) {
-                    setOpen(false);
+                    const button = document.querySelector(buttonSelector + " button");
+                    updateClass(false);
+                    if (button) {
+                        syncingClose = true;
+                        button.click();
+                    }
                     event.preventDefault();
                     event.stopPropagation();
                 }
