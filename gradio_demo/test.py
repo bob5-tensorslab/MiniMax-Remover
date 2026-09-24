@@ -1,4 +1,5 @@
 import os
+import logging
 import gradio as gr
 import cv2
 import numpy as np
@@ -39,6 +40,7 @@ from pipeline_minimax_remover import Minimax_Remover_Pipeline
 from diffusers.utils import export_to_video
 from decord import VideoReader, cpu
 from moviepy.editor import ImageSequenceClip
+from video_compositor import composite_video
 
 from sam2 import load_model
 
@@ -49,6 +51,8 @@ COLOR_PALETTE = [
     (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
     (0, 255, 255), (255, 128, 0), (128, 0, 255), (0, 128, 255), (128, 255, 0)
 ]
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 random_seed = 42
 video_length = 201
@@ -90,8 +94,8 @@ def read_uploaded_mask_video(mask_video_path, frame_count, source_fps, width, he
     ).astype(np.int64)
     if len(mask_indices) and mask_indices[-1] >= len(mask_reader):
         gr.Warning(
-            "掩码视频时长不足，无法覆盖当前源视频和选择的帧数。"
-            "请上传更长的掩码视频，或减少跟踪帧数 N。"
+            "Mask视频时长不足，无法覆盖当前源视频和选择的帧数。"
+            "请上传更长的Mask视频，或减少跟踪帧数 N。"
         )
         return None
 
@@ -168,8 +172,8 @@ def build_fixed_mask_video(painted_data, video_path, n_frames, video_state):
         mask_clip.close()
 
     return mask_video_file, (
-        f"已生成固定掩码视频：{frame_count} 帧，{source_fps:.3f} FPS。"
-        "点击“移除目标”开始处理。"
+        f"已生成固定Mask视频：{frame_count} 帧，{source_fps:.3f} FPS。"
+        "点击“擦除目标”开始处理。"
     )
 
 
@@ -210,7 +214,7 @@ def get_video_info(video_path, video_state):
 
 def handle_video_change(video_path, video_state):
     image = get_video_info(video_path, video_state)
-    return image, image, video_state, None, None, None
+    return image, image, video_state, None, None, None, None, ""
 
 def segment_frame(evt: gr.SelectData, label, video_state):
     if video_state["origin_images"] is None:
@@ -294,21 +298,29 @@ def preprocess_for_removal(images, masks):
     return torch.from_numpy(arr_images).half().to(device), torch.from_numpy(arr_masks).half().to(device)
 
 
-def inference_and_return_video(
+def _inference_and_return_video(
     dilation_iterations,
     num_inference_steps,
     video_path,
     mask_video_path,
     n_frames,
+    paste_back,
     video_state=None,
 ):
+    logger.info(
+        "Removal request: paste_back=%s requested_frames=%s source=%s mask=%s",
+        paste_back,
+        n_frames,
+        video_path,
+        mask_video_path,
+    )
     if video_state is None:
         video_state = {}
 
     source_video_path = video_path or video_state.get("video_path")
     if video_path and video_state.get("video_path") not in (None, video_path):
         gr.Warning("上传的源视频已变更，请等待首帧刷新完成。")
-        return None
+        return None, None, "源视频正在刷新，请稍后重试。"
     if source_video_path and mask_video_path:
         source_reader = VideoReader(source_video_path, ctx=cpu(0))
         source_fps = get_video_fps(source_reader)
@@ -317,26 +329,26 @@ def inference_and_return_video(
         del source_reader
         if not images:
             gr.Warning("源视频不包含可用帧")
-            return None
+            return None, None, "源视频不包含可用帧。"
 
         height, width = images[0].shape[:2]
         masks = read_uploaded_mask_video(
             mask_video_path, frame_count, source_fps, width, height
         )
         if masks is None:
-            return None
+            return None, None, "Mask视频时长不足，无法覆盖所选帧数；请上传更长的Mask视频或减少处理帧数 N。"
         video_state["origin_images"] = images
         video_state["masks"] = masks
         video_state["video_path"] = source_video_path
         video_state["video_fps"] = source_fps
     elif video_state.get("origin_images") is None or video_state.get("masks") is None:
         gr.Warning(
-            "Upload both the source and mask videos for direct removal, or run Tracking first."
+            "Upload both the source and mask videos for direct erasure, or run Tracking first."
         )
-        return None
+        return None, None, "请上传源视频和Mask视频，或先运行跟踪。"
     elif video_path and video_state.get("video_path") != video_path:
         gr.Warning("The uploaded source video changed; upload its mask video or run Tracking again.")
-        return None
+        return None, None, "源视频已更改；请重新上传对应的Mask视频或重新运行跟踪。"
 
     images = video_state["origin_images"]
     masks = video_state["masks"]
@@ -378,7 +390,48 @@ def inference_and_return_video(
         logger=None,
         ffmpeg_params=["-frames:v", str(len(output_frames))],
     )
-    return video_file
+    logger.info("Removal video created: %s (%s frames)", video_file, len(output_frames))
+    if paste_back:
+        try:
+            logger.info("Paste-back started: source=%s mask=%s", source_video_path, mask_video_path)
+            output_file = composite_video(
+                source_video_path,
+                video_file,
+                mask_video_path,
+                mask_grow_pixels=int(dilation_iterations) + 15,
+            )
+            logger.info("Paste-back completed: %s", output_file)
+            return video_file, output_file, f"贴回完成：共处理 {len(output_frames)} 帧。"
+        except Exception as exc:
+            logger.exception("Paste-back failed")
+            gr.Warning(f"结果已生成，但贴回原视频失败：{exc}")
+            return video_file, None, f"贴回失败：{exc}。擦除结果保留在左侧视频。"
+    return video_file, None, f"擦除完成：共处理 {len(output_frames)} 帧。贴回选项未勾选。"
+
+
+def inference_and_return_video(
+    dilation_iterations,
+    num_inference_steps,
+    video_path,
+    mask_video_path,
+    n_frames,
+    paste_back,
+    video_state=None,
+):
+    try:
+        return _inference_and_return_video(
+            dilation_iterations,
+            num_inference_steps,
+            video_path,
+            mask_video_path,
+            n_frames,
+            paste_back,
+            video_state,
+        )
+    except Exception as exc:
+        logger.exception("Removal request failed")
+        gr.Warning(f"擦除处理失败：{exc}")
+        return None, None, f"擦除处理失败：{exc}"
 
 
 def track_video(n_frames, video_path, mask_video_path, video_state):
@@ -544,7 +597,7 @@ with gr.Blocks() as demo:
                 ["./normal_videos/5.mp4"],
             ],
             inputs=[video_input],
-            label="选择要移除目标的视频。",
+            label="选择要擦除目标的视频。",
             elem_id="my-btn2"
         )
 
@@ -581,6 +634,11 @@ with gr.Blocks() as demo:
         #fixed-mask-status {
             width: 60% !important;
             margin: 0 auto !important;
+        }
+        #raw-removal-result {
+            width: 60% !important;
+            margin: 0 auto !important;
+            box-sizing: border-box !important;
         }
         #my-md {
            margin: 0 auto;
@@ -680,9 +738,9 @@ with gr.Blocks() as demo:
 
         with gr.Row(elem_id="my-btn"):
             n_frames_slider = gr.Slider(minimum=1, maximum=361, value=81, step=1, label="处理帧数 N")
-            track_btn = gr.Button("跟踪并生成掩码")
+            track_btn = gr.Button("跟踪并生成Mask视频")
         fixed_mask_editor = gr.Image(
-            label="在首帧上涂抹固定掩码（白色区域将被移除）",
+            label="在首帧上涂抹固定Mask（白色区域将被擦除）",
             source="upload",
             tool="sketch",
             type="numpy",
@@ -694,28 +752,44 @@ with gr.Blocks() as demo:
         )
         with gr.Row(elem_id="fixed-mask-actions"):
             fixed_mask_zoom_btn = gr.Button("放大涂抹区（按 Esc 返回）", elem_id="mask-editor-zoom-button", scale=1)
-            fixed_mask_btn = gr.Button("生成固定掩码视频（所选帧数）", scale=1)
+            fixed_mask_btn = gr.Button("生成固定Mask视频（所选帧数）", scale=1)
         fixed_mask_status = gr.Markdown(
-            "在首帧涂抹目标区域，生成固定掩码视频后，点击“移除目标”开始处理。",
+            "在首帧涂抹目标区域，生成固定Mask视频后，点击“擦除目标”开始处理。",
             elem_id="fixed-mask-status",
         )
         mask_video_input = gr.Video(
-            label="掩码视频（黑底、亮色前景）",
+            label="Mask视频（黑底、亮色前景）",
             elem_id="my-mask-video",
         )
         gr.Markdown(
-            "直接移除：上传源视频与掩码视频后，点击“移除目标”即可处理；"
-            "点选掩码仅在需要预览或传播跟踪时使用。",
+            "直接擦除：上传源视频与Mask视频后，点击“擦除目标”即可处理；"
+            "点选Mask仅在需要预览或传播跟踪时使用。",
             elem_id="mask-video-help",
         )
         video_output = gr.Video(label="跟踪结果", elem_id="my-video")
 
         with gr.Column(elem_id="my-btn"):
-            dilation_slider = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="掩码膨胀")
+            dilation_slider = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="Mask膨胀")
             inference_steps_slider = gr.Slider(minimum=1, maximum=100, value=6, step=1, label="推理步数")
 
-        remove_btn = gr.Button("移除目标", elem_id="my-btn")
-        remove_video = gr.Video(label="移除结果", elem_id="my-video")
+        remove_btn = gr.Button("擦除目标", elem_id="my-btn")
+        with gr.Row(elem_id="my-btn"):
+            paste_back_checkbox = gr.Checkbox(
+                label="将擦除结果贴回原视频（保留Mask外区域与原音频）",
+                value=True,
+            )
+        with gr.Accordion(
+            "原始擦除结果（确认后展开）",
+            open=False,
+            elem_id="raw-removal-result",
+        ):
+            remove_video = gr.Video(label="原始擦除结果", elem_id="my-video")
+        paste_back_video = gr.Video(
+            label="贴回后的原视频",
+            elem_id="my-video",
+            visible=True,
+        )
+        removal_status = gr.Markdown()
         fixed_mask_btn.click(
             build_fixed_mask_video,
             inputs=[fixed_mask_editor, video_input, n_frames_slider, video_state],
@@ -729,19 +803,25 @@ with gr.Blocks() as demo:
                 video_input,
                 mask_video_input,
                 n_frames_slider,
+                paste_back_checkbox,
                 video_state,
             ],
-            outputs=remove_video,
+            outputs=[remove_video, paste_back_video, removal_status],
+        )
+        paste_back_checkbox.change(
+            fn=lambda enabled: gr.update(visible=enabled),
+            inputs=paste_back_checkbox,
+            outputs=paste_back_video,
         )
         video_input.change(
             fn=handle_video_change,
             inputs=[video_input, video_state],
-            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video],
+            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video, paste_back_video, removal_status],
         )
         get_info_btn.click(
             fn=handle_video_change,
             inputs=[video_input, video_state],
-            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video],
+            outputs=[image_output, fixed_mask_editor, video_state, mask_video_input, video_output, remove_video, paste_back_video, removal_status],
         )
         image_output.select(fn=segment_frame, inputs=[point_prompt, video_state], outputs=image_output)
         clear_btn.click(clear_clicks, inputs=video_state, outputs=image_output)
@@ -785,4 +865,5 @@ with gr.Blocks() as demo:
             return [];
         }""",
     )
+demo.queue(concurrency_count=1)
 demo.launch(server_name="0.0.0.0", server_port=8000)
