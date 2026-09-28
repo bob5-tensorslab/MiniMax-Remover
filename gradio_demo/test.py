@@ -1,5 +1,6 @@
 import os
 import logging
+import html
 import gradio as gr
 import cv2
 import numpy as np
@@ -36,6 +37,7 @@ from transformer_minimax_remover import Transformer3DModel
 from einops import rearrange
 from diffusers.schedulers import UniPCMultistepScheduler
 from pipeline_minimax_remover import Minimax_Remover_Pipeline
+from device_config import get_device
 
 from diffusers.utils import export_to_video
 from decord import VideoReader, cpu
@@ -56,9 +58,12 @@ logger.setLevel(logging.INFO)
 
 random_seed = 42
 video_length = 201
+REMOVAL_CHUNK_FRAMES = 81
+REMOVAL_CHUNK_STRIDE = REMOVAL_CHUNK_FRAMES - 1
+MAX_REMOVAL_FRAMES = 801
 W = 1024
 H = W
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = get_device()
 
 def get_pipe_image_and_video_predictor():
     vae = AutoencoderKLWan.from_pretrained("./model/vae", torch_dtype=torch.float16)
@@ -108,7 +113,7 @@ def read_uploaded_mask_video(mask_video_path, frame_count, source_fps, width, he
         binary_mask = cv2.resize(
             binary_mask, (width, height), interpolation=cv2.INTER_NEAREST
         )
-        masks.append(np.repeat(binary_mask[:, :, None], 3, axis=2).astype(np.float32))
+        masks.append(binary_mask)
     del mask_reader
     return masks
 
@@ -298,6 +303,69 @@ def preprocess_for_removal(images, masks):
     return torch.from_numpy(arr_images).half().to(device), torch.from_numpy(arr_masks).half().to(device)
 
 
+def remove_video_in_chunks(images, masks, num_inference_steps, iterations):
+    """Run 81-frame windows, using each prior erased result as the next reference."""
+    frame_count = len(images)
+    if frame_count != len(masks):
+        raise ValueError("源视频帧数与Mask帧数不匹配。")
+    if frame_count > MAX_REMOVAL_FRAMES:
+        raise ValueError(f"最多支持处理 {MAX_REMOVAL_FRAMES} 帧。")
+
+    output_frames = []
+    generator = torch.Generator(device=device).manual_seed(random_seed)
+    start = 0
+    while start < frame_count:
+        end = min(start + REMOVAL_CHUNK_FRAMES, frame_count)
+        chunk_images = list(images[start:end])
+        chunk_masks = list(masks[start:end])
+        valid_frames = len(chunk_images)
+        has_reference_frame = bool(output_frames)
+        if has_reference_frame:
+            # Reuse the previous erased result as an unmasked context frame.
+            # This keeps the seam fixed while the model generates the next 80.
+            chunk_images[0] = output_frames[-1]
+            chunk_masks[0] = np.zeros_like(chunk_masks[0])
+
+        image_tensor, mask_tensor = preprocess_for_removal(chunk_images, chunk_masks)
+        mask_tensor = mask_tensor[:, :, :, :1]
+        if mask_tensor.shape[1] < mask_tensor.shape[2]:
+            height, width = 480, 832
+        else:
+            height, width = 832, 480
+
+        chunk_output = pipe(
+            images=image_tensor,
+            masks=mask_tensor,
+            num_frames=valid_frames,
+            height=height,
+            width=width,
+            num_inference_steps=int(num_inference_steps),
+            generator=generator,
+            iterations=int(iterations),
+        ).frames[0]
+        chunk_output = np.uint8(np.clip(chunk_output * 255, 0, 255))
+
+        if not output_frames:
+            output_frames.extend(chunk_output)
+        else:
+            # The reference frame is context only; retain its previous output
+            # and append predictions for the next 80 source frames.
+            output_frames.extend(chunk_output[1:])
+
+        logger.info(
+            "Removal chunk complete: frames %s-%s of %s",
+            start + 1,
+            end,
+            frame_count,
+        )
+        del image_tensor, mask_tensor, chunk_output
+        if end == frame_count:
+            break
+        start += REMOVAL_CHUNK_STRIDE
+
+    return output_frames
+
+
 def _inference_and_return_video(
     dilation_iterations,
     num_inference_steps,
@@ -350,35 +418,19 @@ def _inference_and_return_video(
         gr.Warning("The uploaded source video changed; upload its mask video or run Tracking again.")
         return None, None, "源视频已更改；请重新上传对应的Mask视频或重新运行跟踪。"
 
-    images = video_state["origin_images"]
-    masks = video_state["masks"]
-
-    images = np.array(images)
-    masks = np.array(masks)
-    img_tensor, mask_tensor = preprocess_for_removal(images, masks)
-    mask_tensor = mask_tensor[:,:,:,:1]
-
-    if mask_tensor.shape[1] < mask_tensor.shape[2]:
-        height = 480
-        width = 832
-    else:
-        height = 832
-        width = 480
+    requested_frame_count = min(MAX_REMOVAL_FRAMES, max(1, int(n_frames)))
+    images = list(video_state["origin_images"][:requested_frame_count])
+    masks = list(video_state["masks"][:requested_frame_count])
+    if not images or len(images) != len(masks):
+        return None, None, "源视频帧数与Mask帧数不匹配，请重新生成Mask视频或运行跟踪。"
 
     with torch.no_grad():
-        out = pipe(
-                images=img_tensor,
-                masks=mask_tensor,
-                num_frames=mask_tensor.shape[0],
-                height=height,
-                width=width,
-                num_inference_steps=int(num_inference_steps),
-                generator=torch.Generator(device=device).manual_seed(random_seed),
-                iterations=int(dilation_iterations)
-        ).frames[0]
-
-        out = np.uint8(out * 255)
-        output_frames = [img for img in out]
+        output_frames = remove_video_in_chunks(
+            images,
+            masks,
+            num_inference_steps=num_inference_steps,
+            iterations=dilation_iterations,
+        )
 
     video_file = f"/tmp/{time.time()}-{random.random()}-removed_output.mp4"
     clip = ImageSequenceClip(output_frames, fps=video_state.get("video_fps", 15.0))
@@ -418,8 +470,9 @@ def inference_and_return_video(
     paste_back,
     video_state=None,
 ):
+    started_at = time.perf_counter()
     try:
-        return _inference_and_return_video(
+        result = _inference_and_return_video(
             dilation_iterations,
             num_inference_steps,
             video_path,
@@ -431,7 +484,23 @@ def inference_and_return_video(
     except Exception as exc:
         logger.exception("Removal request failed")
         gr.Warning(f"擦除处理失败：{exc}")
-        return None, None, f"擦除处理失败：{exc}"
+        result = (None, None, f"擦除处理失败：{exc}")
+
+    elapsed_seconds = time.perf_counter() - started_at
+    total_seconds = int(elapsed_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    elapsed_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    logger.info("Removal request finished: elapsed_seconds=%.2f", elapsed_seconds)
+
+    video_file, paste_back_file, status = result
+    centered_status = (
+        "<div style='width:100%;text-align:center;'>"
+        f"{html.escape(str(status))}<br>"
+        f"<strong>处理耗时：{elapsed_text}</strong>"
+        "</div>"
+    )
+    return video_file, paste_back_file, centered_status
 
 
 def track_video(n_frames, video_path, mask_video_path, video_state):
@@ -724,6 +793,7 @@ with gr.Blocks() as demo:
         }
 
         #mask-video-help { width: 60% !important; box-sizing: border-box !important; margin: 0 auto !important; text-align: center !important; overflow-wrap: anywhere !important; }
+        #removal-status { text-align: center !important; }
         .mask-editor-close { display: none !important; }
         #fixed-mask-editor.mask-editor-expanded .mask-editor-close.mask-editor-close-visible {
             position: absolute !important; top: 12px !important; right: 12px !important; z-index: 10020 !important;
@@ -737,7 +807,7 @@ with gr.Blocks() as demo:
             clear_btn = gr.Button("清空点选")
 
         with gr.Row(elem_id="my-btn"):
-            n_frames_slider = gr.Slider(minimum=1, maximum=361, value=81, step=1, label="处理帧数 N")
+            n_frames_slider = gr.Slider(minimum=1, maximum=MAX_REMOVAL_FRAMES, value=81, step=1, label="处理帧数 N（最多 801 帧，分段处理）")
             track_btn = gr.Button("跟踪并生成Mask视频")
         fixed_mask_editor = gr.Image(
             label="在首帧上涂抹固定Mask（白色区域将被擦除）",
@@ -789,7 +859,7 @@ with gr.Blocks() as demo:
             elem_id="my-video",
             visible=True,
         )
-        removal_status = gr.Markdown()
+        removal_status = gr.Markdown(elem_id="removal-status")
         fixed_mask_btn.click(
             build_fixed_mask_video,
             inputs=[fixed_mask_editor, video_input, n_frames_slider, video_state],

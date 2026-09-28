@@ -30,10 +30,11 @@ variant_to_config_mapping: Dict[str, str] = {
 def get_sdp_backends(dropout_p: float) -> Union[List[SDPBackend], SDPBackend]:
     backends = []
     if torch.cuda.is_available():
-        use_flash_attn = torch.cuda.get_device_properties(0).major >= 8
+        gpu_index = torch.cuda.current_device()
+        use_flash_attn = torch.cuda.get_device_properties(gpu_index).major >= 8
         pytorch_version = tuple(int(v) for v in torch.__version__.split(".")[:2])
 
-        if torch.cuda.get_device_properties(0).major < 7:
+        if torch.cuda.get_device_properties(gpu_index).major < 7:
             backends.append(SDPBackend.EFFICIENT_ATTENTION)
 
         if use_flash_attn:

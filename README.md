@@ -62,6 +62,10 @@ cd gradio_demo
 python3 test.py
 ```
 
+The demo processes videos in 81-frame windows with a one-frame overlap. Each later window uses the previous erased result as an unmasked reference frame and generates the following 80 frames. It supports up to 801 frames per request.
+
+All demo entry points select the GPU through `MINIMAX_GPU_INDEX` (default: `1`). Set it before launch to use another GPU, for example `MINIMAX_GPU_INDEX=0 python3 test.py`.
+
 ---
 
 ## 📂 Download

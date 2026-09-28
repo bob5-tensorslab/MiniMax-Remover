@@ -12,6 +12,7 @@ from diffusers.models import AutoencoderKLWan
 from transformer_minimax_remover import Transformer3DModel
 from diffusers.schedulers import UniPCMultistepScheduler
 from pipeline_minimax_remover import Minimax_Remover_Pipeline
+from device_config import get_device
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -39,7 +40,7 @@ COLOR_PALETTE = [
 random_seed = 42
 W = 1024
 H = W
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = get_device()
 
 def get_pipe_and_predictor():
     vae = AutoencoderKLWan.from_pretrained("./model/vae", torch_dtype=torch.float16)

@@ -5,10 +5,11 @@ from diffusers.models import AutoencoderKLWan
 from transformer_minimax_remover import Transformer3DModel
 from diffusers.schedulers import UniPCMultistepScheduler
 from pipeline_minimax_remover import Minimax_Remover_Pipeline
+from gradio_demo.device_config import get_device
 
 random_seed = 42
 video_length = 81
-device = torch.device("cuda:0")
+device = get_device()
 
 vae = AutoencoderKLWan.from_pretrained("./vae", torch_dtype=torch.float16)
 transformer = Transformer3DModel.from_pretrained("./transformer", torch_dtype=torch.float16)
